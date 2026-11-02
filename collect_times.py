@@ -10,8 +10,8 @@ from playwright.async_api import async_playwright
 
 
 ROOT = Path(__file__).resolve().parent
-SWIMMER_FILE = ROOT / "swimer_ids.txt"
-PROFILE_DIR = ROOT / "edge-profile"
+SWIMMER_FILE = ROOT / "swimmer_ids.txt"
+PROFILE_DIR = ROOT / "chrome-profile"
 OUTPUT_DIR = ROOT / "output"
 ATHLETE_URL = "https://dhy-prod.usaswimming.org/search/athlete/{swimmer_id}/all-times?sortBy=Newest"
 MAX_PAGES = 1000
@@ -180,6 +180,90 @@ async def wait_for_results(page, seen_rows=None):
     return results
 
 
+async def extract_swimmer_name(page, swimmer_id):
+    page_names = await page.evaluate(
+        """() => Array.from(document.querySelectorAll("p[class*='textXl']"))
+            .filter((element) => {
+                const style = window.getComputedStyle(element);
+                return style.textTransform === "uppercase"
+                    && element.getClientRects().length > 0;
+            })
+            .map((element) => element.textContent || "")"""
+    )
+    for candidate in page_names:
+        name = re.sub(r"\s+", " ", str(candidate)).strip()
+        if (
+            2 <= len(name) <= 80
+            and name.casefold() != swimmer_id.casefold()
+            and any(character.isalpha() for character in name)
+            and all(
+                character.isalpha() or character in " -'’."
+                for character in name
+            )
+        ):
+            return name
+
+    result = await page.evaluate(
+        """async (swimmerId) => {
+            let deviceId = localStorage.getItem("deviceId");
+            if (!deviceId) {
+                const fingerprint = [
+                    navigator.platform || "platform",
+                    navigator.vendor || "vendor",
+                    "unknown",
+                    Date.now()
+                ].join(" - ");
+                const encoded = btoa(fingerprint);
+                deviceId =
+                    encoded.slice(0, 15) + encoded.slice(0, 5) + encoded.slice(15);
+                localStorage.setItem("deviceId", deviceId);
+            }
+
+            const response = await fetch(
+                `/api/times/swims/TimesSearch/GetMember/${encodeURIComponent(swimmerId)}`,
+                {
+                    credentials: "include",
+                    headers: { "Device-Id": deviceId, "X-CSRF": "1" }
+                }
+            );
+            if (!response.ok) {
+                return { status: response.status, member: null };
+            }
+            return { status: response.status, member: await response.json() };
+        }""",
+        swimmer_id,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("USA Swimming returned an invalid swimmer lookup response.")
+    status = result.get("status")
+    if status != 200:
+        raise RuntimeError(
+            f"USA Swimming swimmer lookup failed with HTTP {status}. "
+            "Confirm that Chrome is signed in and the ID is valid."
+        )
+
+    member = result.get("member")
+    if not isinstance(member, dict):
+        return None
+
+    name = member.get("shortName")
+    if not isinstance(name, str) or not name.strip():
+        name_parts = [
+            member.get("preferredName") or member.get("firstName"),
+            member.get("middleName"),
+            member.get("lastName"),
+        ]
+        name = " ".join(
+            part.strip()
+            for part in name_parts
+            if isinstance(part, str) and part.strip()
+        )
+    name = re.sub(r"\s+", " ", name).strip() if isinstance(name, str) else ""
+    if not name or name.casefold() == swimmer_id.casefold():
+        return None
+    return name
+
+
 def unique_headers(headers, width):
     names = []
     used = set(BASE_COLUMNS)
@@ -203,6 +287,7 @@ async def collect_rows(page, swimmer_id):
     )
     await page.locator("body").wait_for()
     table = await wait_for_results(page)
+    swimmer_name = await extract_swimmer_name(page, swimmer_id)
 
     collected_headers = []
     collected_rows = []
@@ -246,7 +331,51 @@ async def collect_rows(page, swimmer_id):
             f"All Times page loaded. Page title: {title!r}, URL: {page.url}"
         )
 
-    return collected_headers, collected_rows
+    return collected_headers, collected_rows, swimmer_name
+
+
+async def collect_swimmers(swimmers, on_browser_ready=None):
+    """Fetch and append time snapshots for the requested swimmers."""
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    failures = []
+    saved = []
+
+    async with async_playwright() as playwright:
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            channel="chrome",
+            headless=False,
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto(
+                "https://dhy-prod.usaswimming.org/",
+                wait_until="domcontentloaded",
+            )
+            if on_browser_ready is not None:
+                await on_browser_ready()
+
+            for swimmer_id, swimmer_name in swimmers:
+                try:
+                    headers, rows, page_name = await collect_rows(page, swimmer_id)
+                    resolved_name = page_name or swimmer_name
+                    if not resolved_name:
+                        raise RuntimeError(
+                            "Could not identify the swimmer name on the USA "
+                            "Swimming page. The swimmer was not added to the roster."
+                        )
+                    output_path = write_csv(
+                        swimmer_id, resolved_name, headers, rows
+                    )
+                    saved.append(
+                        (swimmer_id, resolved_name, len(rows), str(output_path))
+                    )
+                except (PlaywrightError, RuntimeError, OSError) as error:
+                    failures.append((swimmer_id, str(error)))
+        finally:
+            await context.close()
+
+    return saved, failures
 
 
 def write_csv(swimmer_id, swimmer_name, headers, rows):
@@ -295,38 +424,22 @@ def write_csv(swimmer_id, swimmer_name, headers, rows):
 
 async def main():
     swimmers = load_swimmers()
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    failures = []
 
-    async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            channel="msedge",
-            headless=False,
+    async def wait_for_login():
+        print(
+            "Chrome is open with the collector's dedicated profile. "
+            "Sign in if needed, then return here."
         )
-        try:
-            page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(
-                "https://dhy-prod.usaswimming.org/",
-                wait_until="domcontentloaded",
-            )
-            print(
-                "Edge is open with the collector's dedicated profile. Sign in if "
-                "needed, then return here."
-            )
-            await asyncio.to_thread(input, "Press Enter to collect swimmer times...")
+        await asyncio.to_thread(input, "Press Enter to collect swimmer times...")
 
-            for swimmer_id, swimmer_name in swimmers:
-                try:
-                    headers, rows = await collect_rows(page, swimmer_id)
-                    output_path = write_csv(swimmer_id, swimmer_name, headers, rows)
-                    print(f"{swimmer_id}: saved {len(rows)} rows to {output_path}")
-                except (PlaywrightError, RuntimeError, OSError) as error:
-                    failures.append((swimmer_id, str(error)))
-                    print(f"{swimmer_id}: FAILED: {error}", file=sys.stderr)
-        finally:
-            await context.close()
-
+    saved, failures = await collect_swimmers(
+        swimmers, on_browser_ready=wait_for_login
+    )
+    for swimmer_id, swimmer_name, row_count, output_path in saved:
+        print(
+            f"{swimmer_id} ({swimmer_name}): saved {row_count} rows "
+            f"to {output_path}"
+        )
     if failures:
         print("\nSome swimmers could not be collected:", file=sys.stderr)
         for swimmer_id, error in failures:
