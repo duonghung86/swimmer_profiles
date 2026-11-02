@@ -41,3 +41,19 @@ The script reads swimmer CSV files in `output` and writes
 `output\best_times.csv`. Each swimmer gets one row, each event gets a column,
 and each value is that swimmer's fastest recorded time for the event across
 all collected snapshots.
+
+## Extract time standards
+
+The USA motivational standards and Texas TAGS PDFs in `input` can be combined
+for one gender and age. Install the dependencies with the existing
+`requirements.txt`, then run:
+
+```powershell
+.\.venv\Scripts\python.exe .\extract_time_standards.py Girls 12
+```
+
+The `get_time_standards(gender, age)` function returns a pandas DataFrame and
+saves the same rows to `output\time_standards_<gender>_<age>.csv`. Gender may
+be Girls/Boys or Female/Male, and age is an integer from 1 through 18. Texas
+TAGS standards are available only through age 14; for older ages, the Texas
+column is empty while USA standards are still included.
